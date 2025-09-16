@@ -373,7 +373,6 @@ async function runKMeansGPU({ u32pixels, width, height, k, iters }) {
     setStatus(`Iteration ${iter+1} / ${iters}`);
     const encoder = device.createCommandEncoder();
 
-    // clear sums+counts
     {
       const pass = encoder.beginComputePass();
       pass.setPipeline(pipelines.clear);
@@ -382,7 +381,6 @@ async function runKMeansGPU({ u32pixels, width, height, k, iters }) {
       pass.end();
     }
 
-    // assign + accumulate
     {
       const pass = encoder.beginComputePass();
       pass.setPipeline(pipelines.assign);
@@ -391,7 +389,6 @@ async function runKMeansGPU({ u32pixels, width, height, k, iters }) {
       pass.end();
     }
 
-    // update centroids
     {
       const pass = encoder.beginComputePass();
       pass.setPipeline(pipelines.update);
@@ -404,7 +401,6 @@ async function runKMeansGPU({ u32pixels, width, height, k, iters }) {
     await device.queue.onSubmittedWorkDone();
   }
 
-  // Write quantized pixels
   {
     const encoder = device.createCommandEncoder();
     const pass = encoder.beginComputePass();
@@ -416,7 +412,6 @@ async function runKMeansGPU({ u32pixels, width, height, k, iters }) {
     await device.queue.onSubmittedWorkDone();
   }
 
-  // Read back outBuf
   const readback = device.createBuffer({ size: n*4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
   {
     const encoder = device.createCommandEncoder();
@@ -463,7 +458,6 @@ els.run.addEventListener('click', async () => {
       k, iters,
     });
     setStatus(`Done. K=${k}, iters=${iters}`);
-    // stash for download
     window.__quantized__ = { width: state.width, height: state.height, data: outU32 };
     els.download.disabled = false;
   } catch (err) {
@@ -505,3 +499,4 @@ els.download.addEventListener('click', () => {
 </script>
 </body>
 </html>
+
