@@ -1,0 +1,507 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>WebGPU K-Means Color Quantization</title>
+  <style>
+    :root { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, Noto Sans, "Apple Color Emoji", "Segoe UI Emoji"; }
+    body { margin: 0; padding: 24px; background: #0b0d10; color: #e6e8eb; }
+    h1 { font-size: 20px; margin: 0 0 12px; }
+    .app { max-width: 1120px; margin: 0 auto; display: grid; gap: 16px; }
+    .row { display: grid; grid-template-columns: 1fr; gap: 16px; align-items: start; }
+    @media (min-width: 960px) { .row { grid-template-columns: 1.1fr 1fr; } }
+    .card { background: #101318; border: 1px solid #1b2028; border-radius: 16px; padding: 16px; box-shadow: 0 6px 20px rgba(0,0,0,.25); }
+    .controls { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+    .controls label { display: grid; gap: 6px; font-size: 12px; color: #c1c7cf; }
+    input[type="number"], input[type="file"], button, select { background: #0e1116; color: #e6e8eb; border: 1px solid #222733; border-radius: 10px; padding: 10px 12px; }
+    button { cursor: pointer; font-weight: 600; }
+    button.primary { background: #1769ff; border-color: #1769ff; }
+    button:disabled { opacity: .5; cursor: not-allowed; }
+    canvas { width: 100%; height: auto; background: #0b0d10; border-radius: 12px; border: 1px solid #1b2028; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    .small { font-size: 12px; color: #9aa3ad; }
+    .footer { display: flex; gap: 8px; align-items: center; justify-content: space-between; }
+    .err { color: #ff6b6b; font-weight: 600; }
+    .pill { font-size: 12px; padding: 4px 8px; border: 1px solid #2b3342; border-radius: 999px; }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <h1>K-Means Color Quantization (WebGPU)</h1>
+
+    <div class="card">
+      <div class="controls">
+        <label>Upload image
+          <input id="file" type="file" accept="image/*" />
+        </label>
+        <label>Clusters (K)
+          <input id="k" type="number" min="2" max="64" value="8" />
+        </label>
+        <label>Iterations
+          <input id="iters" type="number" min="1" max="50" value="8" />
+        </label>
+        <label>Resize (max side px)
+          <input id="maxside" type="number" min="64" max="4096" value="1024" />
+        </label>
+      </div>
+      <div style="margin-top:12px; display:flex; gap:8px; flex-wrap:wrap;">
+        <button id="run" class="primary" disabled>Run K-Means on GPU</button>
+        <button id="download" disabled>Download Result</button>
+        <span id="status" class="pill">Waiting for image…</span>
+      </div>
+    </div>
+
+    <div class="row">
+      <div class="card">
+        <div class="small" style="margin-bottom:8px;">Original</div>
+        <canvas id="src" ></canvas>
+      </div>
+      <div class="card">
+        <div class="small" style="margin-bottom:8px;">Quantized</div>
+        <canvas id="dst" ></canvas>
+      </div>
+    </div>
+
+    <div class="card small">
+      <div id="log"></div>
+    </div>
+
+    <div class="footer small">
+      <div>Runs entirely in your browser using <strong>WebGPU</strong>.</div>
+      <div id="adapterinfo"></div>
+    </div>
+  </div>
+
+<script type="module">
+const els = {
+  file: document.getElementById('file'),
+  k: document.getElementById('k'),
+  iters: document.getElementById('iters'),
+  maxside: document.getElementById('maxside'),
+  run: document.getElementById('run'),
+  download: document.getElementById('download'),
+  status: document.getElementById('status'),
+  src: document.getElementById('src'),
+  dst: document.getElementById('dst'),
+  log: document.getElementById('log'),
+  adapterinfo: document.getElementById('adapterinfo')
+};
+
+function log(msg) {
+  const div = document.createElement('div');
+  div.textContent = msg;
+  els.log.prepend(div);
+}
+
+function setStatus(text, ok=true) {
+  els.status.textContent = text;
+  els.status.style.borderColor = ok ? '#2b3342' : '#ff6b6b';
+  els.status.style.color = ok ? '#9aa3ad' : '#ffb0b0';
+}
+
+function packRGBA(r,g,b,a=255) { return (a<<24) | (b<<16) | (g<<8) | (r); }
+
+function unpackRGBA(u32) { return [u32 & 255, (u32>>>8) & 255, (u32>>>16)&255, (u32>>>24)&255]; }
+
+async function initWebGPU() {
+  if (!('gpu' in navigator)) throw new Error('WebGPU not supported. Use Chrome 113+ / Edge / Safari 18+ with WebGPU enabled.');
+  const adapter = await navigator.gpu.requestAdapter();
+  if (!adapter) throw new Error('No GPU adapter available.');
+  const device = await adapter.requestDevice();
+  const limits = device.limits;
+  els.adapterinfo.textContent = `Max storage buffer: ${Math.round(limits.maxStorageBufferBindingSize/1024/1024)} MiB`;
+  return { adapter, device };
+}
+
+// WGSL Shaders
+const clearSumsWGSL = /* wgsl */`
+  struct RGBAtomic { r: atomic<u32>, g: atomic<u32>, b: atomic<u32> };
+  @group(0) @binding(0) var<storage, read_write> sums: array<RGBAtomic>;
+  @group(0) @binding(1) var<storage, read_write> counts: array<atomic<u32>>;
+  @compute @workgroup_size(256)
+  fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= arrayLength(&counts)) { return; }
+    atomicStore(&counts[i], 0u);
+    atomicStore(&sums[i].r, 0u);
+    atomicStore(&sums[i].g, 0u);
+    atomicStore(&sums[i].b, 0u);
+  }
+`;
+
+const assignAccumulateWGSL = /* wgsl */`
+  struct RGBAtomic { r: atomic<u32>, g: atomic<u32>, b: atomic<u32> };
+  struct Centroids { data: array<vec3<f32>> };
+  @group(0) @binding(0) var<storage, read> pixels: array<u32>;
+  @group(0) @binding(1) var<storage, read_write> assignments: array<u32>;
+  @group(0) @binding(2) var<storage, read_write> sums: array<RGBAtomic>;
+  @group(0) @binding(3) var<storage, read_write> counts: array<atomic<u32>>;
+  @group(0) @binding(4) var<storage, read> centroids: Centroids;
+  @group(0) @binding(5) var<uniform> numCentroids: u32;
+
+  fn unpack(u: u32) -> vec3<f32> {
+    let r: f32 = f32(u & 255u);
+    let g: f32 = f32((u >> 8u) & 255u);
+    let b: f32 = f32((u >> 16u) & 255u);
+    return vec3<f32>(r,g,b);
+  }
+
+  @compute @workgroup_size(256)
+  fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= arrayLength(&pixels)) { return; }
+    let p = unpack(pixels[i]);
+
+    var bestIdx: u32 = 0u;
+    var bestDist: f32 = 1e30;
+    for (var k: u32 = 0u; k < numCentroids; k = k + 1u) {
+      let c = centroids.data[k];
+      let d = distance(p, c);
+      if (d < bestDist) {
+        bestDist = d;
+        bestIdx = k;
+      }
+    }
+    assignments[i] = bestIdx;
+    // Atomically accumulate sums & counts
+    atomicAdd(&counts[bestIdx], 1u);
+    atomicAdd(&sums[bestIdx].r, u32(p.x));
+    atomicAdd(&sums[bestIdx].g, u32(p.y));
+    atomicAdd(&sums[bestIdx].b, u32(p.z));
+  }
+`;
+
+const updateCentroidsWGSL = /* wgsl */`
+  struct RGBAtomic { r: atomic<u32>, g: atomic<u32>, b: atomic<u32> };
+  struct Centroids { data: array<vec3<f32>> };
+  @group(0) @binding(0) var<storage, read_write> centroids: Centroids;
+  @group(0) @binding(1) var<storage, read_write> sums: array<RGBAtomic>;
+  @group(0) @binding(2) var<storage, read_write> counts: array<atomic<u32>>;
+  @compute @workgroup_size(256)
+  fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= arrayLength(&counts)) { return; }
+    let cnt = atomicLoad(&counts[i]);
+    if (cnt > 0u) {
+      let sr = f32(atomicLoad(&sums[i].r));
+      let sg = f32(atomicLoad(&sums[i].g));
+      let sb = f32(atomicLoad(&sums[i].b));
+      centroids.data[i] = vec3<f32>(sr, sg, sb) / vec3<f32>(f32(cnt));
+    }
+  }
+`;
+
+const writeQuantizedWGSL = /* wgsl */`
+  struct Centroids { data: array<vec3<f32>> };
+  @group(0) @binding(0) var<storage, read> assignments: array<u32>;
+  @group(0) @binding(1) var<storage, read> centroids: Centroids;
+  @group(0) @binding(2) var<storage, read_write> outPixels: array<u32>;
+
+  fn clamp8(x: f32) -> u32 { return u32(max(0.0, min(255.0, x))); }
+
+  @compute @workgroup_size(256)
+  fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= arrayLength(&assignments)) { return; }
+    let idx = assignments[i];
+    let c = centroids.data[idx];
+    let r = clamp8(c.x);
+    let g = clamp8(c.y);
+    let b = clamp8(c.z);
+    let a: u32 = 255u;
+    outPixels[i] = (a<<24u) | (b<<16u) | (g<<8u) | r;
+  }
+`;
+
+function createBuffer(device, arr, usage) {
+  const [buffer, mapped] = (() => {
+    const b = device.createBuffer({
+      size: arr.byteLength,
+      usage,
+      mappedAtCreation: true,
+    });
+    return [b, new Uint8Array(b.getMappedRange())];
+  })();
+  new Uint8Array(arr.buffer).forEach((v, i) => { mapped[i] = v; });
+  (buffer).unmap();
+  return buffer;
+}
+
+function createEmpty(device, size, usage) {
+  return device.createBuffer({ size, usage });
+}
+
+function ceilDiv(a,b){ return Math.floor((a + b - 1) / b); }
+
+let gpu = null;
+let device = null;
+let pipelines = null;
+let state = { width:0, height:0, pixelsU32: null };
+
+async function setupGPU() {
+  if (gpu) return; // already
+  const ctx = await initWebGPU();
+  gpu = ctx; device = ctx.device;
+  const moduleClear = device.createShaderModule({ code: clearSumsWGSL });
+  const moduleAssign = device.createShaderModule({ code: assignAccumulateWGSL });
+  const moduleUpdate = device.createShaderModule({ code: updateCentroidsWGSL });
+  const moduleWrite = device.createShaderModule({ code: writeQuantizedWGSL });
+
+  pipelines = {
+    clear: device.createComputePipeline({ layout: 'auto', compute: { module: moduleClear, entryPoint: 'main' } }),
+    assign: device.createComputePipeline({ layout: 'auto', compute: { module: moduleAssign, entryPoint: 'main' } }),
+    update: device.createComputePipeline({ layout: 'auto', compute: { module: moduleUpdate, entryPoint: 'main' } }),
+    write: device.createComputePipeline({ layout: 'auto', compute: { module: moduleWrite, entryPoint: 'main' } }),
+  };
+}
+
+function drawToCanvas(canvas, width, height, u32pixels) {
+  canvas.width = width; canvas.height = height;
+  const ctx = canvas.getContext('2d');
+  const imgData = ctx.createImageData(width, height);
+  const u8 = new Uint8ClampedArray(imgData.data.buffer);
+  const src = new Uint32Array(u32pixels.buffer);
+  // We need to convert from RGBA little-endian (pack) to ImageData order (RGBA)
+  // On little-endian platforms, we can copy bytes directly.
+  new Uint8Array(src.buffer).forEach((v, i) => { u8[i] = v; });
+  ctx.putImageData(imgData, 0, 0);
+}
+
+async function loadImageToCanvas(file, maxSide) {
+  const bmp = await createImageBitmap(await file, { colorSpaceConversion: 'none' });
+  let { width, height } = bmp;
+  if (Math.max(width, height) > maxSide) {
+    const scale = maxSide / Math.max(width, height);
+    width = Math.max(1, Math.round(width * scale));
+    height = Math.max(1, Math.round(height * scale));
+  }
+  const tmp = document.createElement('canvas');
+  tmp.width = width; tmp.height = height;
+  const tctx = tmp.getContext('2d', { willReadFrequently: true });
+  tctx.drawImage(bmp, 0, 0, width, height);
+  const img = tctx.getImageData(0,0,width,height);
+  const u8 = img.data; // Uint8ClampedArray RGBA
+  const u32 = new Uint32Array(width*height);
+  for (let i=0, p=0; i<u32.length; i++, p+=4) {
+    u32[i] = packRGBA(u8[p], u8[p+1], u8[p+2], u8[p+3]);
+  }
+  drawToCanvas(els.src, width, height, new Uint32Array(u32.buffer));
+  return { width, height, u32 };
+}
+
+function kmeansInitCentroids(u32pixels, k) {
+  // Simple k-means++ style seeding on CPU (lightweight and improves results)
+  // For brevity, use random unique picks fallback.
+  const n = u32pixels.length;
+  const getRGB = (u) => { const [r,g,b] = unpackRGBA(u); return [r,g,b]; };
+  const centroids = [];
+  // pick first randomly
+  centroids.push(getRGB(u32pixels[Math.floor(Math.random()*n)]));
+  while (centroids.length < k) {
+    // compute distances to nearest centroid
+    const d2 = new Float32Array(n);
+    for (let i=0;i<n;i++){
+      const [r,g,b] = getRGB(u32pixels[i]);
+      let best = Infinity;
+      for (let c=0;c<centroids.length;c++){
+        const cr=centroids[c][0], cg=centroids[c][1], cb=centroids[c][2];
+        const dr=r-cr, dg=g-cg, db=b-cb; const dist = dr*dr+dg*dg+db*db;
+        if (dist < best) best = dist;
+      }
+      d2[i]=best;
+    }
+    // choose weighted by distance squared
+    let sum=0; for (let i=0;i<n;i++) sum+=d2[i];
+    let r = Math.random()*sum; let idx=0;
+    for (; idx<n-1 && r>0; idx++){ r-=d2[idx]; }
+    centroids.push(getRGB(u32pixels[idx]));
+  }
+  return new Float32Array(centroids.flat()); // vec3 per centroid
+}
+
+async function runKMeansGPU({ u32pixels, width, height, k, iters }) {
+  await setupGPU();
+  setStatus('Preparing GPU buffers…');
+
+  const n = u32pixels.length;
+  const pixelsBuf = createBuffer(device, new Uint32Array(u32pixels.buffer), GPUBufferUsage.STORAGE);
+  const assignBuf = createEmpty(device, n * 4, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
+  const outBuf    = createEmpty(device, n * 4, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST);
+
+  const centroidsCPU = kmeansInitCentroids(u32pixels, k);
+  const centroidsBuf = createBuffer(device, centroidsCPU, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC);
+
+  // sums: array<RGBAtomic>, counts: array<atomic<u32>>
+  const sumsStructSize = 12; // 3 * u32 (we use atomic<u32>, same size). WGSL alignment makes each 4 bytes; packed inside struct fine.
+  const sumsBuf = device.createBuffer({ size: k * 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST });
+  // 16 to be safe for alignment (r,g,b + padding)
+  const countsBuf = device.createBuffer({ size: k * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST });
+
+  const numCentroidsUBO = device.createBuffer({ size: 4, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  device.queue.writeBuffer(numCentroidsUBO, 0, new Uint32Array([k]));
+
+  const groupClear = device.createBindGroup({ layout: pipelines.clear.getBindGroupLayout(0), entries: [
+    { binding: 0, resource: { buffer: sumsBuf } },
+    { binding: 1, resource: { buffer: countsBuf } },
+  ]});
+
+  const groupAssign = device.createBindGroup({ layout: pipelines.assign.getBindGroupLayout(0), entries: [
+    { binding: 0, resource: { buffer: pixelsBuf } },
+    { binding: 1, resource: { buffer: assignBuf } },
+    { binding: 2, resource: { buffer: sumsBuf } },
+    { binding: 3, resource: { buffer: countsBuf } },
+    { binding: 4, resource: { buffer: centroidsBuf } },
+    { binding: 5, resource: { buffer: numCentroidsUBO } },
+  ]});
+
+  const groupUpdate = device.createBindGroup({ layout: pipelines.update.getBindGroupLayout(0), entries: [
+    { binding: 0, resource: { buffer: centroidsBuf } },
+    { binding: 1, resource: { buffer: sumsBuf } },
+    { binding: 2, resource: { buffer: countsBuf } },
+  ]});
+
+  const groupWrite = device.createBindGroup({ layout: pipelines.write.getBindGroupLayout(0), entries: [
+    { binding: 0, resource: { buffer: assignBuf } },
+    { binding: 1, resource: { buffer: centroidsBuf } },
+    { binding: 2, resource: { buffer: outBuf } },
+  ]});
+
+  const workgroupsFor = (n) => ceilDiv(n, 256);
+
+  for (let iter=0; iter<iters; iter++) {
+    setStatus(`Iteration ${iter+1} / ${iters}`);
+    const encoder = device.createCommandEncoder();
+
+    // clear sums+counts
+    {
+      const pass = encoder.beginComputePass();
+      pass.setPipeline(pipelines.clear);
+      pass.setBindGroup(0, groupClear);
+      pass.dispatchWorkgroups(workgroupsFor(k));
+      pass.end();
+    }
+
+    // assign + accumulate
+    {
+      const pass = encoder.beginComputePass();
+      pass.setPipeline(pipelines.assign);
+      pass.setBindGroup(0, groupAssign);
+      pass.dispatchWorkgroups(workgroupsFor(n));
+      pass.end();
+    }
+
+    // update centroids
+    {
+      const pass = encoder.beginComputePass();
+      pass.setPipeline(pipelines.update);
+      pass.setBindGroup(0, groupUpdate);
+      pass.dispatchWorkgroups(workgroupsFor(k));
+      pass.end();
+    }
+
+    device.queue.submit([encoder.finish()]);
+    await device.queue.onSubmittedWorkDone();
+  }
+
+  // Write quantized pixels
+  {
+    const encoder = device.createCommandEncoder();
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(pipelines.write);
+    pass.setBindGroup(0, groupWrite);
+    pass.dispatchWorkgroups(workgroupsFor(n));
+    pass.end();
+    device.queue.submit([encoder.finish()]);
+    await device.queue.onSubmittedWorkDone();
+  }
+
+  // Read back outBuf
+  const readback = device.createBuffer({ size: n*4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+  {
+    const encoder = device.createCommandEncoder();
+    encoder.copyBufferToBuffer(outBuf, 0, readback, 0, n*4);
+    device.queue.submit([encoder.finish()]);
+  }
+  await readback.mapAsync(GPUMapMode.READ);
+  const outU8 = new Uint8Array(readback.getMappedRange());
+  const outU32 = new Uint32Array(outU8.buffer.slice(0));
+  drawToCanvas(els.dst, width, height, outU32);
+  readback.unmap();
+
+  return outU32;
+}
+
+// UI handlers
+els.file.addEventListener('change', async (e) => {
+  els.run.disabled = true; els.download.disabled = true;
+  try {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setStatus('Loading image…');
+    const maxSide = Number(els.maxside.value);
+    const { width, height, u32 } = await loadImageToCanvas(file, maxSide);
+    state.width = width; state.height = height; state.pixelsU32 = u32;
+    setStatus(`Image loaded: ${width}×${height}`);
+    await setupGPU();
+    els.run.disabled = false;
+  } catch (err) {
+    console.error(err);
+    setStatus(String(err), false);
+  }
+});
+
+els.run.addEventListener('click', async () => {
+  els.run.disabled = true; els.download.disabled = true;
+  try {
+    const k = Math.max(2, Math.min(64, Number(els.k.value)));
+    const iters = Math.max(1, Math.min(50, Number(els.iters.value)));
+    const outU32 = await runKMeansGPU({
+      u32pixels: state.pixelsU32,
+      width: state.width,
+      height: state.height,
+      k, iters,
+    });
+    setStatus(`Done. K=${k}, iters=${iters}`);
+    // stash for download
+    window.__quantized__ = { width: state.width, height: state.height, data: outU32 };
+    els.download.disabled = false;
+  } catch (err) {
+    console.error(err);
+    setStatus(String(err), false);
+  } finally {
+    els.run.disabled = false;
+  }
+});
+
+els.download.addEventListener('click', () => {
+  const q = window.__quantized__;
+  if (!q) return;
+  const c = document.createElement('canvas');
+  c.width = q.width; c.height = q.height;
+  const ctx = c.getContext('2d');
+  const imgData = ctx.createImageData(q.width, q.height);
+  const u8 = new Uint8ClampedArray(imgData.data.buffer);
+  new Uint8Array(q.data.buffer).forEach((v,i)=>{u8[i]=v;});
+  ctx.putImageData(imgData, 0, 0);
+  c.toBlob((blob) => {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `quantized_k${document.getElementById('k').value}.png`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  }, 'image/png');
+});
+
+// Bootstrap
+(async () => {
+  try {
+    await setupGPU();
+    setStatus('Ready. Upload an image.');
+  } catch (err) {
+    setStatus(String(err), false);
+  }
+})();
+</script>
+</body>
+</html>
